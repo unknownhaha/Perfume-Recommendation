@@ -1,0 +1,5 @@
+Approach,Ingredient Overlap,Family Match Rate,ILD (Diversity),Avg Score
+D,0.5793,0.48,0.8479,0.6357
+C,0.4937,0.58,0.8308,0.6348
+B,0.4999,0.58,0.8197,0.6332
+A,0.5912,0.36,0.8612,0.6041

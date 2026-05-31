@@ -1,0 +1,10 @@
+data/.cache/
+data/images/
+data/images.zip
+__pycache__/
+*.pyc
+debug-9df947.log
+.ipynb_checkpoints/
+
+# Optional: uncomment to keep repo smaller (download via data_loader instead)
+# data/perfumes.json
