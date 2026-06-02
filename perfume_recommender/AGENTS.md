@@ -4,14 +4,25 @@ Read this file before editing anything in `perfume_recommender/`. It describes h
 
 ## What this project is
 
-Content-based perfume recommendation (no user ratings). Users pick gender, scent family, and liked notes; the system returns top-N similar perfumes from ~26k items using **KNN + cosine similarity** on sparse feature vectors.
+Content-based perfume recommendation (no user ratings). Users pick gender, scent family, brand, and liked notes; the system returns top-N similar perfumes from ~26k items using a **hybrid score = cosine similarity + Jaccard note overlap** on sparse feature vectors.
 
 - **Dataset**: [doevent/perfume](https://huggingface.co/datasets/doevent/perfume) → `data/perfumes.json`
-- **UI**: Streamlit — `src/app.py`
+- **Shared encoding**: `src/feature_engineering.py` (single source of truth for weights, vocabulary, query/matrix building)
+- **Build artifacts**: `python src/build_models.py` (canonical; replaces hand-running `02_preprocessing.ipynb`)
 - **Inference API**: `recommend()` in `src/recommender.py`
-- **Training / EDA**: Jupyter notebooks in `notebooks/`
+- **Evaluation**: `python src/evaluate.py` (Precision@K, leave-one-out hit-rate, weight sweep)
+- **UI**: Streamlit — `src/app.py`
+- **EDA / legacy comparison**: Jupyter notebooks in `notebooks/`
 
 There is **no rating column**. Do not add supervised rating prediction without new labeled data.
+
+### Production model (current)
+
+- Feature vector: weighted concat of `MultiLabelBinarizer(ingredients, min_count=5)` + per-group-weighted `OneHotEncoder(family, subfamily, gender)`.
+- Weights live in `feature_engineering.WEIGHTS` (ingredients 1.0, family 0.5, subfamily 0.3, gender 0.2 — chosen by the weight sweep).
+- Ranking: `hybrid = 0.7 * cosine + 0.3 * jaccard` (`feature_engineering.HYBRID_WEIGHTS`).
+- Artifacts: `perfume_df.pkl`, `mlb_ingredients.pkl`, `ohe_categories.pkl`, `best_approach.pkl` (= `"HYBRID"`), `feature_config.pkl`, `matrix_HYBRID.npz`.
+- The legacy A/B/C/D matrices and `knn_model.pkl` from the old notebook flow are superseded and no longer used by `recommend()`.
 
 ---
 
@@ -20,27 +31,32 @@ There is **no rating column**. Do not add supervised rating prediction without n
 ```mermaid
 flowchart LR
     json["data/perfumes.json"]
-    nb02["02_preprocessing.ipynb"]
-    artifacts["models/*.pkl + matrix_*.npz"]
-    nb03["03_recommendation_engine.ipynb"]
+    fe["src/feature_engineering.py"]
+    build["src/build_models.py"]
+    artifacts["models/*.pkl + matrix_HYBRID.npz"]
     rec["src/recommender.py"]
+    evalpy["src/evaluate.py"]
     app["src/app.py"]
     imgs["data/images/images/*.jpg"]
 
-    json --> nb02 --> artifacts
-    artifacts --> nb03
+    json --> build
+    fe --> build
+    build --> artifacts
+    fe --> rec
     artifacts --> rec
+    artifacts --> evalpy
     rec --> app
     imgs --> app
 ```
 
 **Runtime path (app / `recommend()`):**
 
-1. Load encoders + `perfume_df.pkl` + `matrix_{approach}.npz` + `knn_model.pkl`
-2. Optionally filter catalog by gender (includes UNISEX)
-3. Build query vector with the **same encoders** as training
-4. Fit/query `NearestNeighbors(metric='cosine', algorithm='brute')` on filtered matrix
-5. Return rows with `similarity` and `similarity_pct`; optional image via `perfume_images`
+1. Load encoders + `perfume_df.pkl` + `matrix_HYBRID.npz`
+2. Filter catalog by gender (includes UNISEX) and optional brand
+3. Build query vector with the **same encoders + weights** as training (via `feature_engineering.build_query_vector`)
+4. `cosine_similarity(query, filtered_matrix)` — single sparse pass, no KNN refit
+5. Re-rank the shortlist by `hybrid = 0.7*cosine + 0.3*jaccard`, attach `matched_notes`
+6. Return rows with `similarity`, `hybrid_score`, `similarity_pct`; optional image via `perfume_images`; small in-memory result cache
 
 ---
 
@@ -70,11 +86,16 @@ perfume_recommender/
 │   ├── 03_recommendation_engine.ipynb
 │   └── 04_evaluation.ipynb
 └── src/
-    ├── data_loader.py        # HF download + load perfumes.json
-    ├── perfume_images.py     # Image download/resolve — see naming rule below
-    ├── recommender.py          # Core recommend() — used by app and notebooks
+    ├── data_loader.py          # HF download + load perfumes.json
+    ├── feature_engineering.py  # Shared: weights, vocab filter, build matrix + query vector
+    ├── build_models.py         # Rebuild all artifacts (canonical builder)
+    ├── perfume_images.py       # Image download/resolve — see naming rule below
+    ├── recommender.py          # Core recommend() — hybrid score, brand filter, matched notes
+    ├── evaluate.py             # Precision@K, leave-one-out hit-rate, weight sweep
     └── app.py                  # Streamlit UI
 ```
+
+Note: `models/` may still contain legacy `matrix_A..D.npz`, `tfidf_description.pkl`, and `knn_model.pkl` from the previous KNN flow. They are unused by the current hybrid `recommend()` and can be ignored or deleted.
 
 ---
 
@@ -89,29 +110,28 @@ The file is **`src/perfume_images.py`**. Streamlit ships its own `streamlit.elem
 from perfume_images import load_image_for_display, images_are_ready
 ```
 
-### 2. Encoder + matrix + `best_approach` must stay aligned
+### 2. Encoding lives in ONE place — keep build + inference aligned
+
+`src/feature_engineering.py` is the single source of truth. Both `build_models.py`
+(offline) and `recommender.py` (inference) import `build_perfume_matrix` /
+`build_query_vector` from it, so the training matrix and query vector cannot
+drift apart.
 
 | If you change… | You must also… |
 |----------------|----------------|
-| `MultiLabelBinarizer` / ingredient cleaning | Re-run `02_preprocessing.ipynb` and `03_recommendation_engine.ipynb` |
-| `OneHotEncoder` categories | Same |
-| Feature approach (A/B/C/D) | Update `best_approach.pkl`, `knn_model.pkl`, and query builder in `recommender.py` |
+| `WEIGHTS`, `MIN_INGREDIENT_COUNT`, or encoding in `feature_engineering.py` | Re-run `python src/build_models.py` (rebuilds `matrix_HYBRID.npz` + encoders) |
+| `HYBRID_WEIGHTS` | No rebuild needed — used only at inference in `recommend()` |
 | `perfume_df.pkl` columns | Update `recommend()` return columns and `app.py` display |
 
-`_build_query_vector()` in `recommender.py` must mirror how matrices were built in `02_preprocessing.ipynb`:
+Do **not** edit weights/encoding in only one of `feature_engineering.py` vs the
+artifacts — always rebuild after changing the module.
 
-| Approach | Feature vector |
-|----------|----------------|
-| A | `MultiLabelBinarizer(ingredients)` only |
-| B | ingredients + `OneHotEncoder(family, subfamily, gender)` |
-| C | B + `TfidfVectorizer(description)` (max_features=500) |
-| D | `ingredients * 2` + categories (production winner) |
+### 3. Inference does not refit KNN
 
-**Production approach is D** (saved in `models/best_approach.pkl`). Changing approach without retraining breaks recommendations.
-
-### 3. Inference refits KNN on the gender-filtered subset
-
-`recommender.recommend()` does **not** use the saved `knn_model.pkl` for queries. It loads the matrix and fits a fresh `NearestNeighbors` on the filtered subset for correct indices. The saved `knn_model.pkl` is for notebooks / full-catalog use. Do not assume `knn.kneighbors` on the global model matches filtered `DataFrame` row order.
+`recommend()` builds the query vector via `feature_engineering.build_query_vector`,
+then computes `cosine_similarity(query, filtered_matrix)` in a single sparse pass
+and re-ranks the shortlist with the hybrid score. There is no per-request
+`NearestNeighbors.fit`. Results are cached in-memory by query signature.
 
 ### 4. Image paths are nested
 
@@ -170,7 +190,15 @@ python -c "from src.data_loader import download_dataset; download_dataset()"
 
 **Build model artifacts (required before app):**
 
-Run in order: `notebooks/02_preprocessing.ipynb` → `notebooks/03_recommendation_engine.ipynb`
+```bash
+python src/build_models.py
+```
+
+(Optional) check quality:
+
+```bash
+python src/evaluate.py
+```
 
 **App:**
 
@@ -190,10 +218,10 @@ Only one Streamlit instance on port 8501 at a time (duplicate processes caused s
 
 ## Rebuilding artifacts from scratch
 
-If preprocessing logic changes:
+If encoding/weights change in `feature_engineering.py`:
 
-1. Run `02_preprocessing.ipynb` → regenerates `perfume_df.pkl`, encoders, `matrix_*.npz`
-2. Run `03_recommendation_engine.ipynb` → picks best approach, saves `knn_model.pkl`, `best_approach.pkl`
+1. Run `python src/build_models.py` → regenerates `perfume_df.pkl`, encoders, `matrix_HYBRID.npz`, `feature_config.pkl`
+2. (Optional) Run `python src/evaluate.py` to confirm metrics did not regress
 3. Restart Streamlit (clears `@st.cache_resource` for `load_options`)
 4. Smoke test: `python -c "import sys; sys.path.insert(0,'src'); from recommender import recommend; print(recommend(['Rose'], family='FLORAL', n=3).columns)"`
 
@@ -202,16 +230,16 @@ If preprocessing logic changes:
 ## Tech stack (do not add unless necessary)
 
 - Python 3.10+
-- `scikit-learn` — `MultiLabelBinarizer`, `OneHotEncoder`, `NearestNeighbors` (cosine, brute)
+- `scikit-learn` — `MultiLabelBinarizer`, `OneHotEncoder`, `cosine_similarity`
 - `scipy.sparse` — feature matrices
 - `joblib` — persistence
 - `streamlit` — UI
 - `Pillow` — image display
 - `huggingface_hub` — dataset + images download
 
-**Not used in v1:** Elasticsearch, sentence-transformers, PyTorch/TensorFlow, user rating models.
+**Not used:** Elasticsearch, sentence-transformers, PyTorch/TensorFlow, user rating models, FAISS.
 
-At ~26k items, full-matrix KNN in RAM is fine (<5 ms per query). No vector DB required.
+At ~26k items, a single sparse `cosine_similarity` pass in RAM is fine (<10 ms per query). No vector DB or GPU required.
 
 ---
 
@@ -228,17 +256,18 @@ At ~26k items, full-matrix KNN in RAM is fine (<5 ms per query). No vector DB re
 
 ```bash
 cd perfume_recommender
-python -c "import sys; sys.path.insert(0,'src'); from recommender import recommend; r=recommend(['Rose','Jasmine'], family='FLORAL', gender='FEMALE', n=3); assert 'similarity' in r.columns; print('OK', len(r))"
+python -c "import sys; sys.path.insert(0,'src'); from recommender import recommend; r=recommend(['Rose','Jasmine'], family='FLORAL', gender='FEMALE', brand='CHANEL', n=3); assert {'hybrid_score','matched_notes'} <= set(r.columns); print('OK', len(r))"
 python -c "import sys; sys.path.insert(0,'src'); from perfume_images import images_are_ready, resolve_image_path; import joblib; df=joblib.load('models/perfume_df.pkl'); p=resolve_image_path(df['image_name'].iloc[0]); print('images ready', images_are_ready(), 'sample', bool(p))"
-python -m py_compile src/app.py src/recommender.py src/perfume_images.py src/data_loader.py
+python -m py_compile src/app.py src/recommender.py src/feature_engineering.py src/build_models.py src/evaluate.py src/perfume_images.py src/data_loader.py
 ```
 
 ---
 
 ## When extending the project
 
-- **New filters (brand, origin):** Filter `df` and `matrix` with the same boolean mask before `NearestNeighbors.fit`.
-- **Free-text search:** New approach E; re-run preprocessing + comparison; update `_build_query_vector`.
+- **New filters (origin, year):** Add the boolean condition to the `mask` in `recommend()` (same pattern as gender/brand) before scoring.
+- **Tune weights:** Edit `WEIGHTS` in `feature_engineering.py`, rebuild, and confirm with `evaluate.py`'s weight sweep.
+- **Free-text search:** Add a TF-IDF block in `feature_engineering.py`, rebuild, and concat into both matrix and query.
 - **Different dataset file:** Update `data_loader.py` filename (`perfumes.json` on HF, not `perfume.json`).
 
 Keep this file updated when you change architecture, artifact names, or the production approach letter.

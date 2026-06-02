@@ -69,6 +69,12 @@ with st.sidebar:
             options=["Any"] + [s.title() for s in subfamilies if s != "UNKNOWN"],
         )
 
+        brand = st.selectbox(
+            "Brand (optional)",
+            options=["Any"] + [b.title() for b in brands if b != "UNKNOWN"],
+            help="Restrict recommendations to a single brand.",
+        )
+
         liked_notes = st.multiselect(
             "Scent Notes You Like",
             options=[i.title() for i in top_ingredients],
@@ -96,7 +102,7 @@ with st.sidebar:
         search_btn = st.button("🔍 Find Perfumes", type="primary", use_container_width=True)
 
 st.title("🌸 Perfume Recommendation System")
-st.caption("Content-Based Filtering · KNN Cosine Similarity · 26k+ perfumes")
+st.caption("Content-Based Filtering · Hybrid (Cosine + Jaccard) · 26k+ perfumes")
 
 if not models_ready:
     st.warning(
@@ -110,7 +116,7 @@ if not search_btn:
     col1, col2, col3 = st.columns(3)
     col1.metric("Total Perfumes", "26,000+")
     col2.metric("Unique Ingredients", "1,000+")
-    col3.metric("Algorithm", "KNN Cosine")
+    col3.metric("Algorithm", "Hybrid Score")
     st.stop()
 
 if not liked_notes:
@@ -123,8 +129,13 @@ with st.spinner("Finding your perfect perfumes..."):
         family=family.upper() if family != "Any" else "UNKNOWN",
         subfamily=subfamily.upper() if subfamily != "Any" else "UNKNOWN",
         gender=gender.upper() if gender != "Any" else "UNKNOWN",
+        brand=brand.upper() if brand != "Any" else None,
         n=n_results,
     )
+
+if len(results) == 0:
+    st.warning("No perfumes match those filters. Try removing the brand or gender filter.")
+    st.stop()
 
 st.success(f"Top {len(results)} perfumes matching your preferences")
 st.subheader("Recommended Perfumes")
@@ -170,6 +181,9 @@ for rank, (_, row) in enumerate(results.iterrows(), start=1):
             if len(row["ingredients"]) > 8:
                 notes += f" +{len(row['ingredients']) - 8} more"
             st.caption(f"Notes: {notes}")
+            matched = row.get("matched_notes") if "matched_notes" in row.index else None
+            if matched:
+                st.markdown(":green[**Matched:**] " + ", ".join(matched))
 
         with col_score:
             sim_val = float(row["similarity"])
@@ -190,4 +204,4 @@ with st.expander("View as table"):
     st.dataframe(display_df, width="stretch", hide_index=True)
 
 st.divider()
-st.caption("Dataset: doevent/perfume · Model: KNN (cosine) · Built with Streamlit")
+st.caption("Dataset: doevent/perfume · Model: Hybrid (Cosine + Jaccard) · Built with Streamlit")
