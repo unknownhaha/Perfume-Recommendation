@@ -1,14 +1,9 @@
 """
-Recommendation engine — loads fitted artifacts and exposes a clean recommend()
-function. Used by both notebooks and the Streamlit app.
+Recommendation engine — KNN with cosine similarity (no Jaccard ranking).
 
-Optimized version:
-- Hybrid relevance score = cosine similarity + Jaccard note overlap.
-- Gender AND brand pre-filtering.
-- Returns the notes that actually matched the user's query (explainability).
-- No per-request KNN refit: scores are computed with a single sparse
-  cosine_similarity call, which is fast at this catalog size.
-- Small in-memory cache for repeated queries.
+Loads fitted artifacts and exposes recommend() for notebooks and Streamlit.
+Fits NearestNeighbors(metric='cosine') on the gender/brand-filtered catalog
+subset per query (same pattern as 03_recommendation_engine.ipynb).
 """
 import os
 import sys
@@ -19,15 +14,13 @@ import joblib
 import numpy as np
 import pandas as pd
 from scipy.sparse import load_npz
-from sklearn.metrics.pairwise import cosine_similarity
 
 import feature_engineering as fe
 
 _MODELS_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
+DEFAULT_K = fe.DEFAULT_K
 
-# Module-level cache — artifacts are loaded once and reused across calls
 _cache: dict = {}
-# Result cache keyed by query signature
 _result_cache: dict = {}
 _RESULT_CACHE_MAX = 256
 
@@ -68,33 +61,31 @@ def _cache_key(liked_ingredients, family, subfamily, gender, brand, n):
 
 
 def recommend(liked_ingredients, family="UNKNOWN", subfamily="UNKNOWN",
-              gender="UNKNOWN", brand=None, description="", n=10):
+              gender="UNKNOWN", brand=None, description="", n=DEFAULT_K):
     """
-    Return top-N recommended perfumes as a DataFrame, ranked by a hybrid score.
+    Return top-N recommended perfumes ranked by KNN cosine similarity.
 
     Parameters
     ----------
-    liked_ingredients : list[str]  — notes the user likes (e.g. ["Rose", "Jasmine"])
-    family            : str        — preferred scent family (e.g. "FLORAL")
-    subfamily         : str        — preferred sub-family (e.g. "SOFT FLORAL")
-    gender            : str        — "MALE" / "FEMALE" / "UNISEX" / "UNKNOWN"
-    brand             : str | None — restrict results to a single brand
-    description       : str        — kept for API compatibility (unused)
-    n                 : int        — number of results to return
+    liked_ingredients : list[str]
+    family, subfamily, gender : str
+    brand : str | None — optional brand filter
+    description : str — unused (API compatibility)
+    n : int — number of neighbors (default 10)
 
     Returns
     -------
-    pd.DataFrame with columns: name_perfume, brand, [image_name], family,
-        subfamily, gender, ingredients, matched_notes, similarity,
-        hybrid_score, similarity_pct
+    pd.DataFrame with similarity, similarity_pct, matched_notes (explainability only)
     """
+    n = min(int(n), DEFAULT_K) if n else DEFAULT_K
+    n = max(1, n)
+
     key = _cache_key(liked_ingredients, family, subfamily, gender, brand, n)
     if key in _result_cache:
         return _result_cache[key].copy()
 
     df, mlb, ohe, matrix = _load_models()
 
-    # Build filter mask (gender + optional brand)
     mask = pd.Series(True, index=df.index)
     if gender.upper() not in ("UNKNOWN", ""):
         mask &= (df["gender"] == gender.upper()) | (df["gender"] == "UNISEX")
@@ -104,36 +95,27 @@ def recommend(liked_ingredients, family="UNKNOWN", subfamily="UNKNOWN",
     filtered_df = df[mask].reset_index(drop=True)
     if len(filtered_df) == 0:
         return filtered_df
-    filtered_matrix = matrix[mask.values]
 
-    # 1. Cosine similarity (vector space) — single sparse pass, no refit
+    filtered_matrix = matrix[mask.values]
     query = fe.build_query_vector(
         liked_ingredients, family, subfamily, gender, mlb, ohe,
     )
-    cos = cosine_similarity(query, filtered_matrix).ravel()
 
-    # 2. Jaccard overlap on the candidate shortlist (cheap re-rank)
+    indices, sims = fe.knn_cosine_topk(query, filtered_matrix, k=n)
+    if len(indices) == 0:
+        return filtered_df.iloc[0:0].copy()
+
     query_notes = {str(i).title() for i in liked_ingredients}
-    shortlist = np.argsort(cos)[::-1][: max(n * 5, 50)]
-
-    jac = np.zeros(len(shortlist))
+    results = filtered_df.iloc[indices].copy()
     matched = []
-    for j, idx in enumerate(shortlist):
+    for idx in indices:
         perfume_notes = set(filtered_df.iloc[idx]["ingredients"])
-        jac[j] = fe.jaccard(query_notes, perfume_notes)
         matched.append(sorted(query_notes & perfume_notes))
 
-    hybrid = (fe.HYBRID_WEIGHTS["cosine"] * cos[shortlist]
-              + fe.HYBRID_WEIGHTS["jaccard"] * jac)
-
-    order = np.argsort(hybrid)[::-1][:n]
-    chosen = shortlist[order]
-
-    results = filtered_df.iloc[chosen].copy()
-    results["matched_notes"] = [matched[o] for o in order]
-    results["similarity"] = cos[chosen].round(4)
-    results["hybrid_score"] = hybrid[order].round(4)
-    results["similarity_pct"] = (results["hybrid_score"] * 100).round(1).astype(str) + "%"
+    results["matched_notes"] = matched
+    results["similarity"] = np.round(sims, 4)
+    results["hybrid_score"] = results["similarity"]
+    results["similarity_pct"] = (results["similarity"] * 100).round(1).astype(str) + "%"
 
     cols = [
         "name_perfume", "brand", "family", "subfamily", "gender",

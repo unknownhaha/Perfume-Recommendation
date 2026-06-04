@@ -1,13 +1,11 @@
 """
-Offline evaluation for the hybrid content-based recommender.
+Offline evaluation — KNN (cosine) at K=10, same scoring as recommender.py.
 
-Metrics (no user ratings required):
-- Precision@K (family)      : fraction of top-K sharing the query's family
-- Precision@K (notes)       : fraction of top-K sharing >= 2 query notes
-- Leave-one-out hit-rate@K  : hide a perfume, query with HALF of its notes,
-                              check whether the held-out perfume returns in top-K
-- Light weight sweep        : try a few ingredient/category weight blends and
-                              report the leave-one-out hit-rate for each
+Metrics:
+- Precision@10 (family)
+- Precision@10 (>=2 shared notes)
+- Leave-one-out hit-rate@10
+- Light weight sweep (LOO@10 per weight candidate)
 
 Run:
     python src/evaluate.py
@@ -22,11 +20,11 @@ sys.path.insert(0, os.path.dirname(__file__))
 import joblib
 import numpy as np
 from scipy.sparse import load_npz
-from sklearn.metrics.pairwise import cosine_similarity
 
 import feature_engineering as fe
 
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
+K = fe.DEFAULT_K
 RNG = np.random.default_rng(42)
 
 
@@ -39,7 +37,7 @@ def _load():
     return df, mlb, ohe, matrix
 
 
-def precision_at_k(df, mlb, ohe, matrix, sample=300, k=10):
+def precision_at_k(df, mlb, ohe, matrix, sample=300, k=K):
     idxs = RNG.choice(len(df), size=min(sample, len(df)), replace=False)
     fam_prec, note_prec = [], []
     for i in idxs:
@@ -48,16 +46,15 @@ def precision_at_k(df, mlb, ohe, matrix, sample=300, k=10):
         query = fe.build_query_vector(
             list(notes), row["family"], row["subfamily"], row["gender"], mlb, ohe
         )
-        cos = cosine_similarity(query, matrix).ravel()
-        top = [j for j in np.argsort(cos)[::-1] if j != i][:k]
-        fam_prec.append(np.mean([df.iloc[j]["family"] == row["family"] for j in top]))
+        top_idx, _ = fe.knn_cosine_topk(query, matrix, k=k, exclude_index=i)
+        fam_prec.append(np.mean([df.iloc[j]["family"] == row["family"] for j in top_idx]))
         note_prec.append(
-            np.mean([len(notes & set(df.iloc[j]["ingredients"])) >= 2 for j in top])
+            np.mean([len(notes & set(df.iloc[j]["ingredients"])) >= 2 for j in top_idx])
         )
     return float(np.mean(fam_prec)), float(np.mean(note_prec))
 
 
-def leave_one_out_hit_rate(df, mlb, ohe, matrix, sample=300, k=10):
+def leave_one_out_hit_rate(df, mlb, ohe, matrix, sample=300, k=K):
     """Query with half of a perfume's notes; is the perfume back in top-K?"""
     idxs = RNG.choice(len(df), size=min(sample, len(df)), replace=False)
     hits = 0
@@ -72,14 +69,13 @@ def leave_one_out_hit_rate(df, mlb, ohe, matrix, sample=300, k=10):
         query = fe.build_query_vector(
             half, row["family"], row["subfamily"], row["gender"], mlb, ohe
         )
-        cos = cosine_similarity(query, matrix).ravel()
-        top = np.argsort(cos)[::-1][:k]
-        if i in top:
+        top_idx, _ = fe.knn_cosine_topk(query, matrix, k=k)
+        if i in top_idx:
             hits += 1
     return hits / evaluated if evaluated else 0.0
 
 
-def weight_sweep(df, sample=200, k=10):
+def weight_sweep(df, sample=200, k=K):
     """Light sweep over ingredient/family weights -> leave-one-out hit-rate."""
     from sklearn.preprocessing import MultiLabelBinarizer, OneHotEncoder
 
@@ -93,8 +89,7 @@ def weight_sweep(df, sample=200, k=10):
     cat_matrix = ohe.fit_transform(df[["family", "subfamily", "gender"]])
 
     candidates = [
-        {"ingredients": 1.0, "family": 0.2, "subfamily": 0.1, "gender": 0.1},
-        {"ingredients": 1.0, "family": 0.3, "subfamily": 0.2, "gender": 0.15},
+        {"ingredients": 1.0, "family": 1.0, "subfamily": 1.0, "gender": 1.0},
         {"ingredients": 1.0, "family": 0.5, "subfamily": 0.3, "gender": 0.2},
         {"ingredients": 2.0, "family": 0.3, "subfamily": 0.2, "gender": 0.15},
     ]
@@ -115,23 +110,23 @@ def main() -> None:
     cfg = joblib.load(f"{MODELS_DIR}/feature_config.pkl") if os.path.exists(
         f"{MODELS_DIR}/feature_config.pkl") else {}
 
-    print("=== Hybrid Recommender Evaluation ===")
+    print("=== KNN Cosine Recommender Evaluation (K=10) ===")
     print(f"Catalog size : {len(df):,}")
     print(f"Vocab size   : {cfg.get('vocab_size', len(mlb.classes_))}")
     print(f"Weights      : {cfg.get('weights', fe.WEIGHTS)}")
-    print(f"Hybrid blend : {cfg.get('hybrid', fe.HYBRID_WEIGHTS)}")
+    print(f"Metric       : NearestNeighbors(metric='cosine')")
     print()
 
-    fam_p, note_p = precision_at_k(df, mlb, ohe, matrix, sample=300, k=10)
+    fam_p, note_p = precision_at_k(df, mlb, ohe, matrix, sample=300, k=K)
     print(f"Precision@10 (family)        : {fam_p:.4f}")
     print(f"Precision@10 (>=2 notes)     : {note_p:.4f}")
 
-    hr = leave_one_out_hit_rate(df, mlb, ohe, matrix, sample=300, k=10)
+    hr = leave_one_out_hit_rate(df, mlb, ohe, matrix, sample=300, k=K)
     print(f"Leave-one-out hit-rate@10    : {hr:.4f}")
     print()
 
     print("Light weight sweep (leave-one-out hit-rate@10):")
-    for w, score in weight_sweep(df, sample=200, k=10):
+    for w, score in weight_sweep(df, sample=200, k=K):
         marker = "  <- current" if w == cfg.get("weights") else ""
         print(f"  ing={w['ingredients']}, fam={w['family']}, "
               f"sub={w['subfamily']}, gen={w['gender']}  ->  {score:.4f}{marker}")

@@ -82,7 +82,8 @@ with st.sidebar:
             help="Pick the notes (ingredients) you enjoy most.",
         )
 
-        n_results = st.slider("Number of recommendations", min_value=5, max_value=20, value=10)
+        n_results = 10
+        st.caption("Recommendations: top **10** (K=10, KNN cosine)")
 
         st.divider()
         st.caption("Perfume photos (optional, ~835 MB one-time download)")
@@ -102,7 +103,7 @@ with st.sidebar:
         search_btn = st.button("🔍 Find Perfumes", type="primary", use_container_width=True)
 
 st.title("🌸 Perfume Recommendation System")
-st.caption("Content-Based Filtering · Hybrid (Cosine + Jaccard) · 26k+ perfumes")
+st.caption("Content-Based Filtering · KNN (cosine similarity, K=10) · 26k+ perfumes")
 
 if not models_ready:
     st.warning(
@@ -116,7 +117,7 @@ if not search_btn:
     col1, col2, col3 = st.columns(3)
     col1.metric("Total Perfumes", "26,000+")
     col2.metric("Unique Ingredients", "1,000+")
-    col3.metric("Algorithm", "Hybrid Score")
+    col3.metric("Algorithm", "KNN Cosine K=10")
     st.stop()
 
 if not liked_notes:
@@ -204,4 +205,4 @@ with st.expander("View as table"):
     st.dataframe(display_df, width="stretch", hide_index=True)
 
 st.divider()
-st.caption("Dataset: doevent/perfume · Model: Hybrid (Cosine + Jaccard) · Built with Streamlit")
+st.caption("Dataset: doevent/perfume · Model: KNN cosine (K=10) · Built with Streamlit")

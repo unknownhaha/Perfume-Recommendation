@@ -23,25 +23,26 @@ from scipy.sparse import csr_matrix, hstack
 # --- Tunable configuration -------------------------------------------------
 
 # Notes appearing in fewer than this many perfumes are dropped from the
-# vocabulary. At 394 raw notes this removes ~21% of the long tail while only
-# 3 perfumes lose all of their notes.
-MIN_INGREDIENT_COUNT = 5
+# vocabulary. Set to 1 (keep every note) to match the optimized.ipynb model
+# comparison, which used the full multi-hot vocabulary.
+MIN_INGREDIENT_COUNT = 1
 
-# Relative importance of each feature group in the final vector. Ingredients
-# dominate; family/sub-family/gender act as contextual tie-breakers. These
-# values were chosen by the weight sweep in evaluate.py (best leave-one-out
-# hit-rate@10 = 0.852).
+# Relative importance of each feature group in the final vector. The model
+# comparison in optimized.ipynb (and src/compare_models.py / svd_kdt_compare.py)
+# found that UNIFORM weights with pure cosine similarity gave the best
+# leave-one-out hit-rate@10 (~0.955), beating the earlier weighted + hybrid
+# blend and the SVD+KDTree pipeline. Keep all groups at 1.0.
 WEIGHTS = {
     "ingredients": 1.00,
-    "family": 0.50,
-    "subfamily": 0.30,
-    "gender": 0.20,
+    "family": 1.00,
+    "subfamily": 1.00,
+    "gender": 1.00,
 }
 
-# Weight blend for the hybrid relevance score used at inference time.
+# Legacy config key in feature_config.pkl (ranking uses KNN cosine only).
 HYBRID_WEIGHTS = {
-    "cosine": 0.70,   # vector-space similarity
-    "jaccard": 0.30,  # direct overlap of the notes the user picked
+    "cosine": 1.00,
+    "jaccard": 0.00,
 }
 
 
@@ -139,3 +140,42 @@ def jaccard(query_notes: set[str], perfume_notes: set[str]) -> float:
     inter = len(query_notes & perfume_notes)
     union = len(query_notes | perfume_notes)
     return inter / union if union else 0.0
+
+
+# --- KNN scoring (shared by recommender + evaluate) ------------------------
+
+DEFAULT_K = 10
+
+
+def knn_cosine_topk(query, matrix: csr_matrix, k: int = DEFAULT_K,
+                    exclude_index: int | None = None):
+    """
+    Top-k catalog indices and cosine similarities via NearestNeighbors.
+
+    Uses metric='cosine' (similarity = 1 - cosine distance). When
+    exclude_index is set, that row is dropped from results (evaluation).
+    """
+    from sklearn.neighbors import NearestNeighbors
+
+    n_samples = matrix.shape[0]
+    if n_samples == 0:
+        return np.array([], dtype=int), np.array([], dtype=np.float64)
+
+    fetch = min(k + (1 if exclude_index is not None else 0), n_samples)
+    model = NearestNeighbors(
+        n_neighbors=fetch, metric="cosine", algorithm="brute", n_jobs=-1,
+    )
+    model.fit(matrix)
+    distances, indices = model.kneighbors(query, n_neighbors=fetch)
+    idx = indices[0]
+    sims = (1.0 - distances[0]).astype(np.float64)
+
+    if exclude_index is not None:
+        keep = idx != exclude_index
+        idx = idx[keep][:k]
+        sims = sims[keep][:k]
+    else:
+        idx = idx[:k]
+        sims = sims[:k]
+
+    return idx, sims
